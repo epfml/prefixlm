@@ -14,7 +14,7 @@ import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
+# from torch.nn.attention.flex_attention import flex_attention
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -45,13 +45,27 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+
+        self.mask = torch.tril(torch.ones(config.sequence_length, config.sequence_length))
+        self.mask[:config.sequence_length // 2, :config.sequence_length // 2] = 1
+        self.mask = self.mask.view(1, 1, config.sequence_length, config.sequence_length)
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.sequence_length, config.sequence_length))
-                                        .view(1, 1, config.sequence_length, config.sequence_length))
+            mask = torch.tril(torch.ones(config.sequence_length, config.sequence_length))
+            mask[:config.sequence_length//2, :config.sequence_length//2] = 1
+            # self.register_buffer("bias", mask.view(1, 1, config.sequence_length, config.sequence_length))
 
-    def forward(self, x):
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.sequence_length, config.sequence_length))
+                                 .view(1, 1, config.sequence_length, config.sequence_length))
+
+    def _get_mask(self, dev, sz, prefix_ind):
+        mask = torch.tril(torch.ones(sz, sz)).to(dev)
+        mask[:prefix_ind, :prefix_ind] = 1
+        return mask.bool()
+
+    def forward(self, x, prefix_ind):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -62,8 +76,9 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=self._get_mask(q.device, T, prefix_ind), dropout_p=self.dropout)
+
+            # y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -82,8 +97,8 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
         self.activation = nn.GELU()
 
@@ -104,11 +119,17 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, prefix_ind):
+        x = x + self.attn(self.ln_1(x), prefix_ind)
         x = x + self.mlp(self.ln_2(x))
         return x
-    
+
+
+def uniform_step(step_loc=100, step_prob=0.9, seq_length=512):
+    if torch.rand(1).item() < step_prob:
+        return torch.randint(0, step_loc, (1,)).item()
+    else:
+        return torch.randint(step_loc, seq_length, (1,)).item()
 
 class GPTBase(nn.Module):
 
@@ -164,7 +185,7 @@ class GPTBase(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, get_logits=False):
+    def forward(self, idx, targets=None, get_logits=False, prefixlm=False, eval_loss=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
@@ -174,20 +195,31 @@ class GPTBase(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        causal_pos = 0
+        if prefixlm:
+            # causal_pos = torch.randint(0, t, (1,)).item()
+            causal_pos = uniform_step(100, 0.9, t)
+
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, causal_pos)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if eval_loss:
+                causal_pos = uniform_step()
+            loss = F.cross_entropy((logits[:,causal_pos:,:]).reshape(-1, logits.size(-1)),
+                                   (targets[:, causal_pos:]).reshape(-1),
+                                   ignore_index=-1,
+                                   reduction='sum')
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
         logits = logits if get_logits else None
-        return {'logits': logits, 'loss': loss}
+        return {'logits': logits, 'loss': loss, 'causal_pos': causal_pos}
 
     def crop_sequence_length(self, sequence_length):
         # model surgery to decrease the block size if necessary
