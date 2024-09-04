@@ -10,7 +10,7 @@ import copy
 import random
 import os
 import numpy as np
-from .utils import eval, get_batch, save_checkpoint
+from .utils import eval, get_batch, save_checkpoint, uniform_step, add_special_token
 
 
 def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, batch_size, sequence_length, eval_freq,
@@ -73,12 +73,21 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         num_samples = 0
         for microstep_idx in range(acc_steps):  # gradient accumulation
             x, y = get_batch(data_train_iter, device=extra_args.device)
+            # breakpoint()
+
+            causal_pos = 0
+            if extra_args.prefixlm_train:
+                # causal_pos = torch.randint(0, t, (1,)).item()
+                causal_pos = uniform_step(100, 0.9, x.shape[1])
+
+                if extra_args.prefix_token:
+                    x, y = add_special_token(x, y, causal_pos)
 
             with type_ctx:
                 with distributed_backend.get_context_for_microstep_forward(model=model, microstep_idx=microstep_idx,
                                                                            gradient_accumulation_steps=acc_steps):
-                    outputs = model(x, targets=y, prefixlm=extra_args.prefixlm_train)
-                    num_samples += (y.shape[1] - outputs['causal_pos']) * y.shape[0]
+                    outputs = model(x, targets=y, causal_pos=causal_pos)
+                    num_samples += (y.shape[1] - causal_pos - 1) * y.shape[0]
 
             seen_samples += num_samples
             loss = outputs['loss'] / num_samples
@@ -118,10 +127,10 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                 val_acc, val_loss, val_perplexity = eval(
                     model,
                     data_val_iter,
-                    extra_args.device,
+                    extra_args,
+                    device=extra_args.device,
                     max_num_batches=eval_steps,
                     ctx=type_ctx,
-                    prefixlm=extra_args.prefixlm_eval,
                 )
 
                 print_string = f"{epoch}/{itr} [train] loss={train_loss:.3f} [val] loss={val_loss:.3f}, pp={val_perplexity:.2f}, acc={val_acc:3f}"

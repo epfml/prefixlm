@@ -124,13 +124,6 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-
-def uniform_step(step_loc=100, step_prob=0.9, seq_length=512):
-    if torch.rand(1).item() < step_prob:
-        return torch.randint(0, step_loc, (1,)).item()
-    else:
-        return torch.randint(step_loc, seq_length, (1,)).item()
-
 class GPTBase(nn.Module):
 
     def __init__(self, config):
@@ -185,10 +178,12 @@ class GPTBase(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, get_logits=False, prefixlm=False, eval_loss=False):
+    def forward(self, idx, targets=None, get_logits=False, causal_pos=0, eval_normalizer=0):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
+
+
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
@@ -196,10 +191,7 @@ class GPTBase(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
 
-        causal_pos = 0
-        if prefixlm:
-            # causal_pos = torch.randint(0, t, (1,)).item()
-            causal_pos = uniform_step(100, 0.9, t)
+
 
         for block in self.transformer.h:
             x = block(x, causal_pos)
@@ -208,10 +200,10 @@ class GPTBase(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            if eval_loss:
-                causal_pos = uniform_step()
-            loss = F.cross_entropy((logits[:,causal_pos:,:]).reshape(-1, logits.size(-1)),
-                                   (targets[:, causal_pos:]).reshape(-1),
+            max_ind = max(causal_pos, eval_normalizer)
+
+            loss = F.cross_entropy((logits[:,max_ind+1:,:]).reshape(-1, logits.size(-1)),
+                                   (targets[:, max_ind+1:]).reshape(-1),
                                    ignore_index=-1,
                                    reduction='sum')
         else:

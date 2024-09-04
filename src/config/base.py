@@ -28,6 +28,7 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument('--grad_clip', default=0.0, type=float) # default value is 1.0 in NanoGPT
     parser.add_argument('--prefixlm_train', action='store_true')
     parser.add_argument('--prefixlm_eval', action='store_true')
+    parser.add_argument('--prefix_token', action='store_true')
     # Dataset params
     parser.add_argument('--dataset', default='slimpajama', choices=['slimpajama', 'wikitext', "shakespeare-char", 'arxiv', "arxiv2000", "arxiv+wiki", 'openwebtext2'])
     parser.add_argument('--vocab_size', default=50304, type=int)
