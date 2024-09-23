@@ -4,15 +4,26 @@ import torch.nn.functional as F
 from contextlib import nullcontext, contextmanager, ExitStack
 
 
-def get_batch(dataloader, device="cpu"):
-    x, y = next(dataloader)
+def get_batch(dataloader, dataset, device="cpu"):
+    if dataset == 'cosmopedia':
+        x, y, loc = next(dataloader)
+    else:
+        x, y = next(dataloader)
     if "cuda" in torch.device(device).type:
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x = x.pin_memory().to(device, non_blocking=True)
         y = y.pin_memory().to(device, non_blocking=True)
+        if dataset == 'cosmopedia':
+            loc = loc.pin_memory().to(device, non_blocking=True)
     else:
         x = x.to(device)
         y = y.to(device)
+        if dataset == 'cosmopedia':
+            loc = loc.to(device)
+
+    if dataset == 'cosmopedia':
+        return x, y, loc
+
     return x, y
 
 
@@ -42,9 +53,17 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
     loss_list_val, acc_list = [], []
     num_samples = 0
     for _ in range(max_num_batches):
-        x, y = get_batch(data_val_iter, device=device)
-        causal_pos = 0
-        if extra_args.prefixlm_eval:
+        if extra_args.dataset == 'cosmopedia':
+            x, y, loc = get_batch(data_val_iter, extra_args.dataset, device=device)
+        else:
+            x, y = get_batch(data_val_iter, extra_args.dataset, device=device)
+
+        causal_pos=0
+        if extra_args.dataset == 'cosmopedia':
+            causal_pos = loc
+            if extra_args.prefix_token:
+                x, y = add_special_token(x, y, causal_pos)
+        elif extra_args.prefixlm_eval:
             # causal_pos = torch.randint(0, t, (1,)).item()
             causal_pos = uniform_step(100, 0.9, x.shape[1])
             if extra_args.prefix_token:
@@ -52,18 +71,17 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
 
         with ctx:
             eval_normalizer = 0
-            if not extra_args.prefixlm_eval:
+            if not extra_args.prefixlm_eval and extra_args.dataset != 'cosmopedia':
                 eval_normalizer = uniform_step(100, 0.9, x.shape[1])
+            # breakpoint()
             outputs = model(x, targets=y, get_logits=True, causal_pos=causal_pos, eval_normalizer=eval_normalizer)
 
-        max_ind = max(causal_pos, eval_normalizer)
-        num_samples += (y.shape[1] - max_ind - 1)*y.shape[0]
+        logit_mask = outputs['logit_mask']
+        num_samples += logit_mask.int().sum().item()
 
         val_loss = outputs['loss']
-        # breakpoint()
         loss_list_val.append(val_loss)
-        # breakpoint()
-        acc_list.append((outputs['logits'].argmax(-1)[:,max_ind+1:] == y[:,max_ind+1:]).float().sum())
+        acc_list.append(torch.sum((outputs['logits'].argmax(-1) == y).float()[logit_mask]))
 
     val_acc = torch.stack(acc_list).sum().item()/num_samples
     val_loss = torch.stack(loss_list_val).sum().item()/num_samples

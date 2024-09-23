@@ -60,12 +60,8 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.sequence_length, config.sequence_length))
                                  .view(1, 1, config.sequence_length, config.sequence_length))
 
-    def _get_mask(self, dev, sz, prefix_ind):
-        mask = torch.tril(torch.ones(sz, sz)).to(dev)
-        mask[:prefix_ind, :prefix_ind] = 1
-        return mask.bool()
 
-    def forward(self, x, prefix_ind):
+    def forward(self, x, attn_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -76,7 +72,7 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=self._get_mask(q.device, T, prefix_ind), dropout_p=self.dropout)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout)
 
             # y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
         else:
@@ -119,8 +115,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, prefix_ind):
-        x = x + self.attn(self.ln_1(x), prefix_ind)
+    def forward(self, x, attn_mask):
+        x = x + self.attn(self.ln_1(x), attn_mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -178,11 +174,36 @@ class GPTBase(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _get_logit_mask(self, b, t, causal_pos, device):
+        if type(causal_pos) == int:
+            logit_mask = torch.zeros(b, t).bool()
+            logit_mask[:, causal_pos+1:] = True
+            return logit_mask
+
+        indexed_rows = torch.arange(t, device=device)[None, :]
+        logit_mask = causal_pos[:, None] < indexed_rows
+
+        return logit_mask
+
+
+    def _get_mask_for_batch(self, dev, sz, prefix_ind):
+        mask = torch.tril(torch.ones(sz, sz, device=dev))
+
+        if type(prefix_ind) == int:
+            mask[:prefix_ind, :prefix_ind] = 1
+            return mask.bool()
+
+        prefix_ind = torch.tensor(prefix_ind, device=dev)
+        mask = torch.arange(sz, device=dev).unsqueeze(0) < prefix_ind.unsqueeze(1)
+
+        final_mask = mask.unsqueeze(2) * mask.unsqueeze(1)
+
+        return final_mask.unsqueeze(1).bool()
+
     def forward(self, idx, targets=None, get_logits=False, causal_pos=0, eval_normalizer=0):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
-
 
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
@@ -191,19 +212,21 @@ class GPTBase(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
 
-
+        attn_mask = self._get_mask_for_batch(device, t, causal_pos)
 
         for block in self.transformer.h:
-            x = block(x, causal_pos)
+            x = block(x, attn_mask)
         x = self.transformer.ln_f(x)
+
+        logit_mask = self._get_logit_mask(b, t, causal_pos, device)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            max_ind = max(causal_pos, eval_normalizer)
 
-            loss = F.cross_entropy((logits[:,max_ind+1:,:]).reshape(-1, logits.size(-1)),
-                                   (targets[:, max_ind+1:]).reshape(-1),
+            # max_ind = max(causal_pos, eval_normalizer)
+            loss = F.cross_entropy((logits[logit_mask,:]).reshape(-1, logits.size(-1)),
+                                   (targets[logit_mask]).reshape(-1),
                                    ignore_index=-1,
                                    reduction='sum')
         else:
@@ -211,7 +234,7 @@ class GPTBase(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
         logits = logits if get_logits else None
-        return {'logits': logits, 'loss': loss, 'causal_pos': causal_pos}
+        return {'logits': logits, 'loss': loss, 'causal_pos': causal_pos, 'logit_mask': logit_mask}
 
     def crop_sequence_length(self, sequence_length):
         # model surgery to decrease the block size if necessary

@@ -7,7 +7,7 @@ from .wikitext import get_wikitext_data
 from .arxiv import get_arxiv_2000, get_arxiv_full
 from .openwebtext2 import get_openwebtext2_data
 from .slimpajama import get_slimpajama_data
-
+from .cosmopedia import get_cosmopedia_data
 
 def get_dataset(args) -> Dict[str, np.ndarray]:
     """ Fetch the right dataset given by the args.dataset parameter. The logic for each dataset is
@@ -31,8 +31,10 @@ def get_dataset(args) -> Dict[str, np.ndarray]:
         return get_openwebtext2_data()
     if args.dataset == "slimpajama":
         return get_slimpajama_data()
+    if args.dataset == 'cosmopedia':
+        return get_cosmopedia_data()
     else:
-        raise NotImplementedError(f"Unknow dataset key '{args.dataset}'")
+        raise NotImplementedError(f"Unknown dataset key '{args.dataset}'")
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, data, sequence_length):
@@ -57,7 +59,48 @@ class Dataset(torch.utils.data.Dataset):
         return x, y
 
 
-def get_dataloader(data, sequence_length, batch_size, seed=0, distributed_backend=None):
+class QADataset(torch.utils.data.Dataset):
+    def __init__(self, data, sequence_length, padding_token=50256):
+        # 50256 is the EOT token for gpt2 tokenizer. we also use it as the tokenized padding token here
+        super().__init__()
+        self.data = data
+        self.sequence_length = sequence_length
+        self.padding_token = padding_token
+
+        self.len_questions, self.len_answers, self.starting_indices = [], [], []
+        self._get_question_lengths()
+
+    def _get_question_lengths(self):
+        num_questions = self.data[0]
+        current_ind = num_questions*2 + 1
+        for i in range(num_questions):
+            self.starting_indices.append(current_ind)
+            self.len_questions.append(self.data[i*2 + 1])
+            self.len_answers.append(self.data[i*2 + 2])
+            current_ind += self.len_questions[-1] + self.len_answers[-1]
+
+    def __len__(self):
+        return self.data[0]
+
+    def __getitem__(self, idx):
+
+        starting = self.starting_indices[idx]
+        len_sample = self.len_questions[idx] + self.len_answers[idx]
+        last_idx = min(self.sequence_length, len_sample) + starting
+
+        x = torch.from_numpy(self.data[starting:last_idx].astype(np.int64))
+        y = torch.from_numpy(self.data[starting+1:last_idx + 1].astype(np.int64))
+
+        #  TODO: here, the prediction for last token doesn't make any sense. Check what to do with it!
+
+        if len_sample < self.sequence_length:
+            x = torch.cat((x, torch.full((self.sequence_length - len(x),), self.padding_token, dtype=torch.int64)))
+            y = torch.cat((y, torch.full((self.sequence_length - len(y),), self.padding_token, dtype=torch.int64)))
+
+        return x, y, self.len_questions[idx].astype(np.int64)
+
+
+def get_dataloader(data, sequence_length, batch_size, dataset='slimpajama', seed=0, distributed_backend=None):
     """Create a DataLoader for the given data. If distributed_backend is provided and is truly
     distributed (world size > 1), the DataLoader will be created with a DistributedSampler that
     splits the data across the processes (in conjunction with DDP).
@@ -65,7 +108,15 @@ def get_dataloader(data, sequence_length, batch_size, seed=0, distributed_backen
 
     Returns both the dataloader and the sampler.
     """
-    dataset = Dataset(data, sequence_length=sequence_length)
+    if dataset == 'cosmopedia':
+        print('Using QADataset')
+        print(data[0])
+        dataset = QADataset(data, sequence_length=sequence_length)
+        print(type(dataset))
+        print(len(dataset))
+    else:
+        dataset = Dataset(data, sequence_length=sequence_length)
+
     if distributed_backend and distributed_backend.get_world_size() > 1:
         sampler = torch.utils.data.DistributedSampler(
             dataset,
@@ -85,4 +136,6 @@ def get_dataloader(data, sequence_length, batch_size, seed=0, distributed_backen
         batch_size=batch_size,
         num_workers=4,
     )
+
+    # breakpoint()
     return loader, sampler
