@@ -65,6 +65,7 @@ class QADataset(torch.utils.data.Dataset):
         super().__init__()
         self.data = data
         self.sequence_length = sequence_length
+        # self.prefix_token = prefix_token
         self.padding_token = padding_token
 
         self.len_questions, self.len_answers, self.starting_indices = [], [], []
@@ -97,7 +98,10 @@ class QADataset(torch.utils.data.Dataset):
             x = torch.cat((x, torch.full((self.sequence_length - len(x),), self.padding_token, dtype=torch.int64)))
             y = torch.cat((y, torch.full((self.sequence_length - len(y),), self.padding_token, dtype=torch.int64)))
 
-        return x, y, self.len_questions[idx].astype(np.int64)
+        return (x,
+                y,
+                min(self.sequence_length-1, self.len_questions[idx].astype(np.int64)),
+                min(len_sample.astype(np.int64), self.sequence_length))
 
 
 def get_dataloader(data, sequence_length, batch_size, dataset='slimpajama', seed=0, distributed_backend=None):
@@ -109,11 +113,7 @@ def get_dataloader(data, sequence_length, batch_size, dataset='slimpajama', seed
     Returns both the dataloader and the sampler.
     """
     if dataset == 'cosmopedia':
-        print('Using QADataset')
-        print(data[0])
         dataset = QADataset(data, sequence_length=sequence_length)
-        print(type(dataset))
-        print(len(dataset))
     else:
         dataset = Dataset(data, sequence_length=sequence_length)
 

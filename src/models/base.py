@@ -14,7 +14,36 @@ import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-# from torch.nn.attention.flex_attention import flex_attention
+
+
+def get_logit_mask(b, t, causal_pos, last_loss_token, device):
+    if type(causal_pos) == int:
+        logit_mask = torch.zeros(b, t).bool()
+        logit_mask[:, causal_pos:last_loss_token] = True
+        return logit_mask
+
+    indexed_rows = torch.arange(t, device=device)[None, :]
+    mask1 = causal_pos[:, None] < indexed_rows
+    mask2 = indexed_rows < last_loss_token[:, None]
+    logit_mask = mask1 * mask2
+
+    return logit_mask
+
+
+def get_mask_for_batch(dev, sz, prefix_ind):
+    mask = torch.tril(torch.ones(sz, sz, device=dev))
+
+    if type(prefix_ind) == int:
+        mask[:prefix_ind, :prefix_ind] = 1
+        return mask.bool()
+
+    prefix_ind = torch.tensor(prefix_ind, device=dev)
+    mask = torch.arange(sz, device=dev).unsqueeze(0) < prefix_ind.unsqueeze(1)
+
+    final_mask = mask.unsqueeze(2) * mask.unsqueeze(1)
+
+    return final_mask.unsqueeze(1).bool()
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -174,33 +203,8 @@ class GPTBase(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def _get_logit_mask(self, b, t, causal_pos, device):
-        if type(causal_pos) == int:
-            logit_mask = torch.zeros(b, t).bool()
-            logit_mask[:, causal_pos+1:] = True
-            return logit_mask
 
-        indexed_rows = torch.arange(t, device=device)[None, :]
-        logit_mask = causal_pos[:, None] < indexed_rows
-
-        return logit_mask
-
-
-    def _get_mask_for_batch(self, dev, sz, prefix_ind):
-        mask = torch.tril(torch.ones(sz, sz, device=dev))
-
-        if type(prefix_ind) == int:
-            mask[:prefix_ind, :prefix_ind] = 1
-            return mask.bool()
-
-        prefix_ind = torch.tensor(prefix_ind, device=dev)
-        mask = torch.arange(sz, device=dev).unsqueeze(0) < prefix_ind.unsqueeze(1)
-
-        final_mask = mask.unsqueeze(2) * mask.unsqueeze(1)
-
-        return final_mask.unsqueeze(1).bool()
-
-    def forward(self, idx, targets=None, get_logits=False, causal_pos=0, eval_normalizer=0):
+    def forward(self, idx, targets=None, last_loss_token=None, get_logits=False, causal_pos=0, eval_normalizer=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
@@ -212,29 +216,37 @@ class GPTBase(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
 
-        attn_mask = self._get_mask_for_batch(device, t, causal_pos)
+        attn_mask = get_mask_for_batch(device, t, causal_pos)
 
         for block in self.transformer.h:
             x = block(x, attn_mask)
         x = self.transformer.ln_f(x)
 
-        logit_mask = self._get_logit_mask(b, t, causal_pos, device)
-
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            assert last_loss_token is not None, "last_loss_token must be provided if targets are given"
+
+            if eval_normalizer is not None:
+                logit_mask = get_logit_mask(b, t, eval_normalizer, last_loss_token, device)
+            else:
+                logit_mask = get_logit_mask(b, t, causal_pos, last_loss_token, device)
+
             logits = self.lm_head(x)
 
-            # max_ind = max(causal_pos, eval_normalizer)
-            loss = F.cross_entropy((logits[logit_mask,:]).reshape(-1, logits.size(-1)),
+            loss = F.cross_entropy((logits[logit_mask, :]).reshape(-1, logits.size(-1)),
                                    (targets[logit_mask]).reshape(-1),
                                    ignore_index=-1,
                                    reduction='sum')
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
             loss = None
         logits = logits if get_logits else None
-        return {'logits': logits, 'loss': loss, 'causal_pos': causal_pos, 'logit_mask': logit_mask}
+        return {'logits': logits,
+                'loss': loss,
+                'causal_pos': causal_pos,
+                'logit_mask': logit_mask,
+                'num_samples': torch.sum(logit_mask).item()}
 
     def crop_sequence_length(self, sequence_length):
         # model surgery to decrease the block size if necessary

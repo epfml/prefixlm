@@ -62,7 +62,6 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         model = torch.compile(model)  # requires pytorch 2.0+
 
     model.train()
-    print('in training mode')
     t0 = time.time()
 
     if rng_state_dict is not None:
@@ -79,28 +78,24 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         print(itr)
         num_samples = 0
         for microstep_idx in range(acc_steps):  # gradient accumulation
+            causal_pos = None
+            last_loss_token = sequence_length
             if extra_args.dataset == 'cosmopedia':
-                x, y, locs = get_batch(data_train_iter, extra_args.dataset, device=extra_args.device)
+                x, y, causal_pos, last_loss_token = get_batch(data_train_iter, extra_args.dataset, device=extra_args.device)
             else:
                 x, y = get_batch(data_train_iter, extra_args.dataset, device=extra_args.device)
+                if extra_args.prefixlm_train:
+                    causal_pos = uniform_step(100, 0.9, x.shape[1])
 
-            causal_pos = 0
-            if extra_args.dataset == 'cosmopedia':
-                causal_pos = locs
-                if extra_args.prefix_token:
-                    x, y = add_special_token(x, y, causal_pos)
-            elif extra_args.prefixlm_train:
-                # causal_pos = torch.randint(0, t, (1,)).item()
-                causal_pos = uniform_step(100, 0.9, x.shape[1])
-
-                if extra_args.prefix_token:
-                    x, y = add_special_token(x, y, causal_pos)
+            if extra_args.prefix_token:
+                assert causal_pos is not None
+                x, y = add_special_token(x, y, causal_pos)
 
             with type_ctx:
                 with distributed_backend.get_context_for_microstep_forward(model=model, microstep_idx=microstep_idx,
                                                                            gradient_accumulation_steps=acc_steps):
-                    outputs = model(x, targets=y, causal_pos=causal_pos)
-                    num_samples += outputs['logit_mask'].int().sum().item()
+                    outputs = model(x, targets=y, last_loss_token=last_loss_token, causal_pos=causal_pos)
+                    num_samples += outputs['num_samples']
                     #  TODO: make this right for the case that we put causal_pos = 0
 
             seen_samples += num_samples
