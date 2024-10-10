@@ -60,7 +60,7 @@ def get_cosmopedia_data(num_proc=40):
             idx = 1 + len(dset)*2
             print('the starting index for writing the data is', idx)
             print('the fist number in the array before for loop', arr[0])
-
+            breakpoint()
             for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
                 # Batch together samples for faster write
                 batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')

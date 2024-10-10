@@ -84,6 +84,7 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
 
             outputs = model(x,
                             targets=y,
+                            prefixlm=extra_args.prefixlm_eval,
                             last_loss_token=last_loss_token,
                             get_logits=True,
                             causal_pos=causal_pos,
@@ -91,6 +92,7 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
 
         logit_mask = outputs['logit_mask']
         num_samples += outputs['num_samples']
+        # breakpoint()
 
         val_loss = outputs['loss']
         loss_list_val.append(val_loss)

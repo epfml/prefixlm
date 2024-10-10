@@ -14,8 +14,7 @@ import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
-
+import numpy as np
 def get_logit_mask(b, t, causal_pos, last_loss_token, device):
     if type(causal_pos) == int:
         logit_mask = torch.zeros(b, t).bool()
@@ -30,19 +29,34 @@ def get_logit_mask(b, t, causal_pos, last_loss_token, device):
     return logit_mask
 
 
-def get_mask_for_batch(dev, sz, prefix_ind):
+def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False):
     mask = torch.tril(torch.ones(sz, sz, device=dev))
 
     if type(prefix_ind) == int:
+        #  TODO: fix the return mask here for the case that prefixlm=False
         mask[:prefix_ind, :prefix_ind] = 1
         return mask.bool()
 
+    #  constructing non-causal attention mask
     prefix_ind = torch.tensor(prefix_ind, device=dev)
-    mask = torch.arange(sz, device=dev).unsqueeze(0) < prefix_ind.unsqueeze(1)
+    mask_non_causal = torch.arange(sz, device=dev).unsqueeze(0) < prefix_ind.unsqueeze(1)
 
-    final_mask = mask.unsqueeze(2) * mask.unsqueeze(1)
+    non_causal = mask_non_causal.unsqueeze(2) * mask_non_causal.unsqueeze(1)
 
-    return final_mask.unsqueeze(1).bool()
+    #  constructing causal attention mask for the tokens after the prefix
+
+    mask_causal = torch.arange(sz, device=dev).unsqueeze(0) < last_loss_token.unsqueeze(1)
+    causal = torch.tril(mask_causal.unsqueeze(2) * mask_causal.unsqueeze(1))
+
+    if prefixlm == False:
+        final_mask = causal.to(torch.float32)
+    else:
+        final_mask = (non_causal | causal).to(torch.float32)
+
+    final_mask[final_mask == 0] = -1e9
+    final_mask[final_mask == 1] = 0
+    # print('last tokens are:', last_loss_token)
+    return final_mask.unsqueeze(1)
 
 
 class LayerNorm(nn.Module):
@@ -102,6 +116,8 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout)
+            if torch.sum(torch.isnan(y).int()) > 0:
+                breakpoint()
 
             # y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
         else:
@@ -111,8 +127,8 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
@@ -157,7 +173,7 @@ class GPTBase(nn.Module):
         assert config.sequence_length is not None
         self.config = config
         self.tokenizer = tiktoken.get_encoding("gpt2")
-
+        # breakpoint()
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.sequence_length, config.n_embd),
@@ -204,7 +220,7 @@ class GPTBase(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
-    def forward(self, idx, targets=None, last_loss_token=None, get_logits=False, causal_pos=0, eval_normalizer=None):
+    def forward(self, idx, targets=None, prefixlm=False, last_loss_token=None, get_logits=False, causal_pos=0, eval_normalizer=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
@@ -213,10 +229,12 @@ class GPTBase(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        abs_pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        rel_pos_emb =
 
-        attn_mask = get_mask_for_batch(device, t, causal_pos)
+        x = self.transformer.drop(tok_emb + abs_pos_emb)
+
+        attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm)
 
         for block in self.transformer.h:
             x = block(x, attn_mask)
@@ -230,23 +248,29 @@ class GPTBase(nn.Module):
                 logit_mask = get_logit_mask(b, t, eval_normalizer, last_loss_token, device)
             else:
                 logit_mask = get_logit_mask(b, t, causal_pos, last_loss_token, device)
-
+            num_samples = torch.sum(logit_mask).item()
             logits = self.lm_head(x)
-
+            # print('number of samples is: ', torch.sum(logit_mask.to(torch.int32)).item())
+            # print('real number: ', torch.sum(last_loss_token - causal_pos-1).item())
+            # breakpoint()
             loss = F.cross_entropy((logits[logit_mask, :]).reshape(-1, logits.size(-1)),
                                    (targets[logit_mask]).reshape(-1),
                                    ignore_index=-1,
                                    reduction='sum')
+            if np.isnan(loss.item()):
+                breakpoint()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
             loss = None
+            logit_mask = None
+            num_samples = None
         logits = logits if get_logits else None
         return {'logits': logits,
                 'loss': loss,
                 'causal_pos': causal_pos,
                 'logit_mask': logit_mask,
-                'num_samples': torch.sum(logit_mask).item()}
+                'num_samples': num_samples}
 
     def crop_sequence_length(self, sequence_length):
         # model surgery to decrease the block size if necessary
@@ -323,7 +347,7 @@ class GPTBase(nn.Module):
 
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, prefixlm=False, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -333,13 +357,19 @@ class GPTBase(nn.Module):
             # if the sequence context is growing too long we must crop it at sequence_length
             idx_cond = idx if idx.size(1) <= self.config.sequence_length else idx[:, -self.config.sequence_length:]
             # forward the model to get the logits for the index in the sequence
-            logits = self(idx_cond, get_logits=True)['logits']
+            # breakpoint()
+            logits = self(idx_cond,
+                          get_logits=True,
+                          prefixlm=prefixlm,
+                          causal_pos=idx_cond.size(1)-2,
+                          last_loss_token=idx_cond.size(1))['logits']
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
+            # breakpoint()
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
@@ -350,7 +380,14 @@ class GPTBase(nn.Module):
         return idx
     
     @torch.no_grad()
-    def generate_from_string(self, in_str, max_new_tokens, temperature=1.0, top_k=None):
+    def generate_from_string(self, in_str, max_new_tokens, temperature=1.0, prefixlm=False, top_k=None):
         idx = torch.tensor(self.tokenizer.encode(in_str, allowed_special={"<|endoftext|>"})).view(1,-1).to(self.lm_head.weight.device)
-        out_idx = self.generate(idx, max_new_tokens, temperature, top_k).view(-1).to('cpu').numpy()
-        return self.tokenizer.decode(out_idx)
+        out_idx = self.generate(idx, max_new_tokens, temperature, prefixlm, top_k).view(-1).to('cpu').numpy()
+        try:
+            decoded = self.tokenizer.decode(out_idx)
+        except BaseException as e:
+            print(f"failed to decode {out_idx}")
+            print(e)
+            breakpoint()
+
+        return decoded

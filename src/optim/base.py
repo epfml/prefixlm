@@ -73,15 +73,19 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         get_batch(data_train_iter, device=extra_args.device)
 
     seen_samples = 0
+    generation_string = []
 
     while itr < iterations:
-        print(itr)
         num_samples = 0
         for microstep_idx in range(acc_steps):  # gradient accumulation
             causal_pos = None
             last_loss_token = sequence_length
             if extra_args.dataset == 'cosmopedia':
                 x, y, causal_pos, last_loss_token = get_batch(data_train_iter, extra_args.dataset, device=extra_args.device)
+                if itr == 0:
+                    # breakpoint()
+                    tokenizer = model.module.tokenizer if hasattr(model, 'module') else model.tokenizer
+                    generation_string = tokenizer.decode(x[0, :causal_pos[0]].to('cpu').numpy())
             else:
                 x, y = get_batch(data_train_iter, extra_args.dataset, device=extra_args.device)
                 if extra_args.prefixlm_train:
@@ -94,7 +98,11 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
             with type_ctx:
                 with distributed_backend.get_context_for_microstep_forward(model=model, microstep_idx=microstep_idx,
                                                                            gradient_accumulation_steps=acc_steps):
-                    outputs = model(x, targets=y, last_loss_token=last_loss_token, causal_pos=causal_pos)
+                    outputs = model(x,
+                                    targets=y,
+                                    prefixlm=extra_args.prefixlm_train,
+                                    last_loss_token=last_loss_token,
+                                    causal_pos=causal_pos)
                     num_samples += outputs['num_samples']
                     #  TODO: make this right for the case that we put causal_pos = 0
 
@@ -119,7 +127,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         scheduler.step()
         opt.zero_grad(set_to_none=True)
         itr += 1
-
+        # breakpoint()
         if itr % eval_freq == 0 or itr == iterations:  # from here it's only evaluation code, all the training is above
             if distributed_backend.is_master_process():
                 t1 = time.time()
@@ -148,6 +156,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                     print_string += f" [lr] {current_lr:.5f}"
                 print(print_string)
 
+
                 if extra_args.wandb:
                     logs = {
                         "iter": itr,
@@ -171,7 +180,8 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                             text_table = wandb.Table(columns=["itr", "val-pp", "text"])
 
                         out_str = distributed_backend.get_raw_model(model).generate_from_string(
-                            extra_args.eval_seq_prefix, max_new_tokens=40, temperature=0.9, top_k=None)
+                            generation_string, max_new_tokens=100, temperature=0.9, top_k=None)
+                        print('out_str is: ', out_str)
                         text_table.add_data(itr, val_perplexity, out_str)
                         # why a copy? see github.com/wandb/wandb/issues/2981
                         wandb.log({f"generated-text-{wandb.run.name}": copy.copy(text_table)})

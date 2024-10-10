@@ -90,7 +90,9 @@ def main(args):
     if distributed_backend.is_master_process() and args.wandb:
         params_copy = copy.deepcopy(vars(args))
         del params_copy['device']
+        print('it gets here')
         wandb.init(project=args.wandb_project, name=exp_name, config=params_copy)
+        print('it doesnt get here?')
     
     ckpt_path = os.path.join(args.results_base_folder, args.dataset, args.model, exp_name)
     if not os.path.exists(ckpt_path):
@@ -146,7 +148,8 @@ def main(args):
                   eval_freq=args.eval_freq, 
                   distributed_backend=distributed_backend,
                   ckpt_path=f"{ckpt_path}/ckpt.pt", itr=itr, rng_state_dict=rng_state_dict, extra_args=args)
-    
+
+
     args.device = None
     args.dtype = None
     stats['args'] = vars(args)
