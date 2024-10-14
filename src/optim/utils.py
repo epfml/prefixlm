@@ -64,7 +64,7 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
     loss_list_val, acc_list = [], []
     num_samples = 0
     for _ in range(max_num_batches):
-        causal_pos = None
+        causal_pos = 0
         last_loss_token = extra_args.sequence_length
         if extra_args.dataset == 'cosmopedia':
             x, y, causal_pos, last_loss_token = get_batch(data_val_iter, extra_args.dataset, device=device)

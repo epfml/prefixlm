@@ -176,11 +176,13 @@ class GPTBase(nn.Module):
         # breakpoint()
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.sequence_length, config.n_embd),
+            # Here I assume we generalize until max_context_ratio! TBD later...
+            wpe = nn.Embedding(config.sequence_length*config.max_context_ratio if config.long_context else config.sequence_length, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -225,15 +227,24 @@ class GPTBase(nn.Module):
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
 
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        if self.config.random_pe:
+            # generating a sorted tensor with non-repeating integers between 0 and
+            # self.config.max_context_ratio*self.config.sequence_length, with size (1, t)
+            max_len = self.config.max_context_ratio*self.config.sequence_length
+            rand_perm = torch.randperm(max_len, device=device, dtype=torch.long)[:t]
+            sorted_pos = rand_perm.sort()[0]
+            pos = sorted_pos.view(1, t)  # shape (1, t)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        abs_pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        rel_pos_emb =
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+
+        abs_pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
+
 
         x = self.transformer.drop(tok_emb + abs_pos_emb)
-
+        # breakpoint()
         attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm)
 
         for block in self.transformer.h:

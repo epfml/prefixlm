@@ -78,7 +78,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
     while itr < iterations:
         num_samples = 0
         for microstep_idx in range(acc_steps):  # gradient accumulation
-            causal_pos = None
+            causal_pos = 0
             last_loss_token = sequence_length
             if extra_args.dataset == 'cosmopedia':
                 x, y, causal_pos, last_loss_token = get_batch(data_train_iter, extra_args.dataset, device=extra_args.device)
