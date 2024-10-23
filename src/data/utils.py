@@ -50,6 +50,7 @@ class Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         seq_length = self.sequence_length
+
         idx = idx * seq_length
         x = torch.from_numpy((self.data[idx : idx + seq_length]).astype(np.int64))
 
@@ -57,7 +58,6 @@ class Dataset(torch.utils.data.Dataset):
             (self.data[idx + 1 : idx + 1 + seq_length]).astype(np.int64)
         )
         return x, y
-
 
 class QADataset(torch.utils.data.Dataset):
     def __init__(self, data, sequence_length, padding_token=50256):

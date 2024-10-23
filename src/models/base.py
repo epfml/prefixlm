@@ -225,7 +225,7 @@ class GPTBase(nn.Module):
     def forward(self, idx, targets=None, prefixlm=False, last_loss_token=None, get_logits=False, causal_pos=0, eval_normalizer=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
+        # assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
 
         if self.config.random_pe:
             # generating a sorted tensor with non-repeating integers between 0 and
@@ -241,7 +241,6 @@ class GPTBase(nn.Module):
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
         abs_pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
-
 
         x = self.transformer.drop(tok_emb + abs_pos_emb)
         # breakpoint()
@@ -267,9 +266,9 @@ class GPTBase(nn.Module):
             loss = F.cross_entropy((logits[logit_mask, :]).reshape(-1, logits.size(-1)),
                                    (targets[logit_mask]).reshape(-1),
                                    ignore_index=-1,
-                                   reduction='sum')
-            if np.isnan(loss.item()):
-                breakpoint()
+                                   reduction='none') #TODO: take care of it for standard context setups
+            # if t == 2048:
+            #     breakpoint()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
@@ -389,9 +388,10 @@ class GPTBase(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-    
+
     @torch.no_grad()
     def generate_from_string(self, in_str, max_new_tokens, temperature=1.0, prefixlm=False, top_k=None):
+        # breakpoint()
         idx = torch.tensor(self.tokenizer.encode(in_str, allowed_special={"<|endoftext|>"})).view(1,-1).to(self.lm_head.weight.device)
         out_idx = self.generate(idx, max_new_tokens, temperature, prefixlm, top_k).view(-1).to('cpu').numpy()
         try:

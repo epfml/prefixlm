@@ -61,27 +61,41 @@ def add_special_token(x, y, causal_pos):
 def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx=nullcontext()):
     assert model.training == False
 
-    loss_list_val, acc_list = [], []
+    loss_dict_val, acc_dict, perplexity_dict = {}, {}, {}
+    loss_dict_val["all"] = []
+    acc_dict["all"] = []
+    sizes = [0 for _ in range(extra_args.max_context_ratio)]
+
     num_samples = 0
+    mx_context = extra_args.max_context_ratio
+    last_loss_token = extra_args.sequence_length
+    original_seq_len = extra_args.sequence_length
+
+    if extra_args.long_context:
+        last_loss_token *= mx_context
+        for i in range(mx_context):
+            loss_dict_val[f"long_context_{i}"] = []
+            acc_dict[f"long_context_{i}"] = []
+
     for _ in range(max_num_batches):
         causal_pos = 0
-        last_loss_token = extra_args.sequence_length
+
         if extra_args.dataset == 'cosmopedia':
             x, y, causal_pos, last_loss_token = get_batch(data_val_iter, extra_args.dataset, device=device)
         else:
             x, y = get_batch(data_val_iter, extra_args.dataset, device=device)
             if extra_args.prefixlm_eval:
-                causal_pos = uniform_step(100, 0.9, x.shape[1])
+                causal_pos = uniform_step(100, 0.9, original_seq_len)
 
         if extra_args.prefix_token:
             assert causal_pos is not None
             x, y = add_special_token(x, y, causal_pos)
 
-        with ctx:
-            eval_normalizer = None
-            if not extra_args.prefixlm_eval and extra_args.dataset != 'cosmopedia':
-                eval_normalizer = uniform_step(100, 0.9, x.shape[1])
+        eval_normalizer = None
+        if extra_args.eval_normalizer:
+            eval_normalizer = uniform_step(100, 0.9, original_seq_len)
 
+        with ctx:
             outputs = model(x,
                             targets=y,
                             prefixlm=extra_args.prefixlm_eval,
@@ -92,17 +106,47 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
 
         logit_mask = outputs['logit_mask']
         num_samples += outputs['num_samples']
+        # if outputs['num_samples'] != 65536:
+        #     print('num_samples is not 65536')
+        #     breakpoint()
         # breakpoint()
 
         val_loss = outputs['loss']
-        loss_list_val.append(val_loss)
-        acc_list.append(torch.sum((outputs['logits'].argmax(-1) == y).float()[logit_mask]))
+        loss_dict_val["all"].append(val_loss.sum())
+        right_preds = (outputs['logits'].argmax(-1) == y)[logit_mask].float()
+        acc_dict["all"].append(torch.sum(right_preds))
 
-    val_acc = torch.stack(acc_list).sum().item()/num_samples
-    val_loss = torch.stack(loss_list_val).sum().item()/num_samples
-    val_perplexity = 2.71828 ** val_loss
+        # breakpoint()
+        if extra_args.long_context:
+            batch_size = x.shape[0]
+            for i in range(mx_context):
+                # breakpoint()
+                start = max(0, i*original_seq_len - causal_pos)
+                #  making sure that we don't get the loss of the prefix
+                end = max((i+1)*original_seq_len - causal_pos, 0)
+                loss_dict_val[f"long_context_{i}"].append(val_loss.view(batch_size, -1)[:, start:end].sum())
+                acc_dict[f"long_context_{i}"].append(right_preds.view(batch_size, -1)[:, start:end].sum())
+                sizes[i] += outputs['logit_mask'][:,start:end].sum()
 
-    return val_acc, val_loss, val_perplexity
+
+    acc_dict["all"] = torch.stack(acc_dict["all"]).sum()/num_samples
+    loss_dict_val["all"] = torch.stack(loss_dict_val["all"]).sum()/num_samples
+
+    perplexity_dict["all"] = 2.71828 ** loss_dict_val["all"]
+    if extra_args.long_context:
+        for i in range(mx_context):
+            acc_dict[f"long_context_{i}"] = torch.stack(acc_dict[f"long_context_{i}"]).sum()/sizes[i]
+            loss_dict_val[f"long_context_{i}"] = torch.stack(loss_dict_val[f"long_context_{i}"]).sum()/sizes[i]
+            perplexity_dict[f"long_context_{i}"] = 2.71828 ** loss_dict_val[f"long_context_{i}"]
+
+    if abs((acc_dict["long_context_0"] + acc_dict["long_context_1"] + acc_dict["long_context_2"] + acc_dict["long_context_3"])/4 - acc_dict["all"]) > 1e-4:
+        print('accuracies dont match')
+        breakpoint()
+    if abs((loss_dict_val["long_context_0"] + loss_dict_val["long_context_1"] + loss_dict_val["long_context_2"] + loss_dict_val["long_context_3"])/4 -  loss_dict_val["all"]) > 1e-4:
+        print('losses dont match')
+        breakpoint()
+
+    return acc_dict, loss_dict_val, perplexity_dict
 
 
 def save_checkpoint(distributed_backend, model, opt, scheduler, itr, ckpt_path, **extra_args):

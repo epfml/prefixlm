@@ -31,9 +31,10 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         distributed_backend=distributed_backend,
     )
 
+
     data["val"], val_sampler = get_dataloader(
         data["val"],
-        sequence_length=sequence_length,
+        sequence_length=sequence_length*extra_args.max_context_ratio if extra_args.long_context else sequence_length,
         batch_size=batch_size,
         dataset=extra_args.dataset,
         seed=data_seed,
@@ -73,7 +74,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         get_batch(data_train_iter, device=extra_args.device)
 
     seen_samples = 0
-    generation_string = []
+    generation_string = extra_args.eval_seq_prefix
 
     while itr < iterations:
         num_samples = 0
@@ -107,7 +108,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                     #  TODO: make this right for the case that we put causal_pos = 0
 
             seen_samples += num_samples
-            loss = outputs['loss'] / num_samples
+            loss = outputs['loss'].sum() / num_samples
             loss.backward()
             substep += 1
             if substep % len(data["train"]) == 0:
@@ -150,7 +151,8 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                     ctx=type_ctx,
                 )
 
-                print_string = f"{epoch}/{itr} [train] loss={train_loss:.3f} [val] loss={val_loss:.3f}, pp={val_perplexity:.2f}, acc={val_acc:3f}"
+                print_string = (f"{epoch}/{itr} [train] loss={train_loss:.3f} [val] loss={val_loss['all'].item():.3f},"
+                                f" pp={val_perplexity['all']:.2f}, acc={val_acc['all']:3f}")
                 print_string += f" [time per itr] {dt * 1000 / eval_freq:.2f}ms"
                 if scheduler is not None:
                     print_string += f" [lr] {current_lr:.5f}"
@@ -161,12 +163,18 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                     logs = {
                         "iter": itr,
                         "train/loss": train_loss,
-                        "val/loss": val_loss,
-                        "val/perplexity": val_perplexity,
-                        "val/acc": val_acc,
+                        "val/loss": val_loss["all"].item(),
+                        "val/perplexity": val_perplexity["all"].item(),
+                        "val/acc": val_acc["all"].item(),
                         "lr": current_lr,
                         "seen-samples": seen_samples
                     }
+
+                    for key in val_loss:
+                        if key != "all":
+                            logs[f"val/loss_{key}"] = val_loss[key].item()
+                            logs[f"val/perplexity_{key}"] = val_perplexity[key].item()
+                            logs[f"val/acc_{key}"] = val_acc[key].item()
 
                     if itr == iterations:
                         logs["val/final-ppl"] = val_perplexity
