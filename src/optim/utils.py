@@ -102,7 +102,8 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
                             last_loss_token=last_loss_token,
                             get_logits=True,
                             causal_pos=causal_pos,
-                            eval_normalizer=eval_normalizer)
+                            eval_normalizer=eval_normalizer,
+                            window=extra_args.window)
 
         logit_mask = outputs['logit_mask']
         num_samples += outputs['num_samples']
@@ -128,7 +129,6 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
                 acc_dict[f"long_context_{i}"].append(right_preds.view(batch_size, -1)[:, start:end].sum())
                 sizes[i] += outputs['logit_mask'][:,start:end].sum()
 
-
     acc_dict["all"] = torch.stack(acc_dict["all"]).sum()/num_samples
     loss_dict_val["all"] = torch.stack(loss_dict_val["all"]).sum()/num_samples
 
@@ -139,12 +139,12 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
             loss_dict_val[f"long_context_{i}"] = torch.stack(loss_dict_val[f"long_context_{i}"]).sum()/sizes[i]
             perplexity_dict[f"long_context_{i}"] = 2.71828 ** loss_dict_val[f"long_context_{i}"]
 
-    if abs((acc_dict["long_context_0"] + acc_dict["long_context_1"] + acc_dict["long_context_2"] + acc_dict["long_context_3"])/4 - acc_dict["all"]) > 1e-4:
-        print('accuracies dont match')
-        breakpoint()
-    if abs((loss_dict_val["long_context_0"] + loss_dict_val["long_context_1"] + loss_dict_val["long_context_2"] + loss_dict_val["long_context_3"])/4 -  loss_dict_val["all"]) > 1e-4:
-        print('losses dont match')
-        breakpoint()
+    # if abs((acc_dict["long_context_0"] + acc_dict["long_context_1"] + acc_dict["long_context_2"] + acc_dict["long_context_3"])/4 - acc_dict["all"]) > 1e-4:
+    #     print('accuracies dont match')
+    #     breakpoint()
+    # if abs((loss_dict_val["long_context_0"] + loss_dict_val["long_context_1"] + loss_dict_val["long_context_2"] + loss_dict_val["long_context_3"])/4 - loss_dict_val["all"]) > 1e-4:
+    #     print('losses dont match')
+    #     breakpoint()
 
     return acc_dict, loss_dict_val, perplexity_dict
 

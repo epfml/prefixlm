@@ -17,6 +17,7 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument('--device', default='cuda:0', type=str)
     parser.add_argument('--iterations', default=25000, type=int)
     parser.add_argument('--lr', default=1e-3, type=float)
+    parser.add_argument('--pe', default='learnable', choices=['learnable', 'rope'])
     parser.add_argument('--warmup_percent', default=0.05, type=float)
     parser.add_argument('--weight_decay', default=0.1, type=float)
     parser.add_argument('--beta1', default=0.9, type=float)
@@ -32,6 +33,7 @@ def parse_args(base_parser, args, namespace):
     # to make evaluation comparable with prefixlm_eval
     # it chooses a prefix and avoid calculating loss for it
     parser.add_argument('--eval_normalizer', action='store_true')
+    parser.add_argument('--window', action='store_true')
     # Dataset params
     parser.add_argument('--dataset', default='slimpajama', choices=['slimpajama', 'wikitext', "shakespeare-char", 'arxiv', "arxiv2000", "arxiv+wiki", 'openwebtext2', 'cosmopedia'])
     parser.add_argument('--vocab_size', default=50304, type=int)

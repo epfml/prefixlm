@@ -29,12 +29,15 @@ def get_logit_mask(b, t, causal_pos, last_loss_token, device):
     return logit_mask
 
 
-def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False):
+def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False, window=False, max_context_ratio=1):
     mask = torch.tril(torch.ones(sz, sz, device=dev))
 
     if type(prefix_ind) == int:
         #  TODO: fix the return mask here for the case that prefixlm=False
         mask[:prefix_ind, :prefix_ind] = 1
+        if window:
+            breakpoint()
+            mask *= torch.triu(torch.ones((sz, sz), device=dev), diagonal=-int(sz/max_context_ratio))
         return mask.bool()
 
     #  constructing non-causal attention mask
@@ -53,6 +56,9 @@ def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False
     else:
         final_mask = (non_causal | causal).to(torch.float32)
 
+    if window:
+        final_mask *= torch.triu(torch.ones((sz, sz), device=dev), diagonal=-int(sz/max_context_ratio)).unsqueeze(0)
+
     final_mask[final_mask == 0] = -1e9
     final_mask[final_mask == 1] = 0
     # print('last tokens are:', last_loss_token)
@@ -69,6 +75,36 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+class RotaryEmbedding(nn.Module):
+
+    def __init__(self, dim, seq_len=2048, base=10000, device=None):
+        super().__init__()
+        self.base = base
+        self.device = device
+        self.dim = dim
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+        self.register_buffer("inv_freq", self.inv_freq)
+
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+
+        freq = torch.einsum('i,j->ij', t, self.inv_freq)
+        emb = torch.cat((freq, freq), dim=-1)
+
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+    @staticmethod
+    def rotate_half(x):
+        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    @staticmethod
+    def apply_rotary_pos_emb(q, k):
+        # q_emb = (q * cos_emb) + (RotaryEmbedding.rotate_half(q) * sin_emb)
+        # k_emb = (k * cos_emb) + (RotaryEmbedding.rotate_half(k) * sin_emb)
+
+        return q, k
 
 
 class CausalSelfAttention(nn.Module):
@@ -112,6 +148,9 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # if pe == 'rope':
+        #     q, k = RotaryEmbedding.apply_rotary_pos_emb(q, k)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -173,16 +212,20 @@ class GPTBase(nn.Module):
         assert config.sequence_length is not None
         self.config = config
         self.tokenizer = tiktoken.get_encoding("gpt2")
-        # breakpoint()
+        self.max_context_ratio = config.max_context_ratio
+
+        effective_seq_len = config.sequence_length*config.max_context_ratio if config.long_context else config.sequence_length
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             # Here I assume we generalize until max_context_ratio! TBD later...
-            wpe = nn.Embedding(config.sequence_length*config.max_context_ratio if config.long_context else config.sequence_length, config.n_embd),
+            wpe = nn.Embedding(effective_seq_len, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
+        if config.pe == 'rope':
+            self.transformer.wpe = RotaryEmbedding(config.n_embd, effective_seq_len, device=config.device)
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -222,7 +265,17 @@ class GPTBase(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
-    def forward(self, idx, targets=None, prefixlm=False, last_loss_token=None, get_logits=False, causal_pos=0, eval_normalizer=None):
+    def forward(self,
+                idx,
+                targets=None,
+                pe='learnable',
+                prefixlm=False,
+                last_loss_token=None,
+                get_logits=False,
+                causal_pos=0,
+                eval_normalizer=None,
+                window=False):
+
         device = idx.device
         b, t = idx.size()
         # assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
@@ -240,11 +293,13 @@ class GPTBase(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
-        abs_pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
+        if pe == 'learnable':
+            abs_pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
+            x = self.transformer.drop(tok_emb + abs_pos_emb)
+        else:
+            x = tok_emb
 
-        x = self.transformer.drop(tok_emb + abs_pos_emb)
-        # breakpoint()
-        attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm)
+        attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm, window, t/self.max_context_ratio)
 
         for block in self.transformer.h:
             x = block(x, attn_mask)
@@ -260,15 +315,12 @@ class GPTBase(nn.Module):
                 logit_mask = get_logit_mask(b, t, causal_pos, last_loss_token, device)
             num_samples = torch.sum(logit_mask).item()
             logits = self.lm_head(x)
-            # print('number of samples is: ', torch.sum(logit_mask.to(torch.int32)).item())
-            # print('real number: ', torch.sum(last_loss_token - causal_pos-1).item())
-            # breakpoint()
+
             loss = F.cross_entropy((logits[logit_mask, :]).reshape(-1, logits.size(-1)),
                                    (targets[logit_mask]).reshape(-1),
                                    ignore_index=-1,
                                    reduction='none') #TODO: take care of it for standard context setups
-            # if t == 2048:
-            #     breakpoint()
+
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim

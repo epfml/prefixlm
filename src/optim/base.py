@@ -77,9 +77,9 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
     generation_string = extra_args.eval_seq_prefix
 
     while itr < iterations:
-        num_samples = 0
         for microstep_idx in range(acc_steps):  # gradient accumulation
             causal_pos = 0
+            num_samples = 0
             last_loss_token = sequence_length
             if extra_args.dataset == 'cosmopedia':
                 x, y, causal_pos, last_loss_token = get_batch(data_train_iter, extra_args.dataset, device=extra_args.device)
@@ -108,7 +108,8 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                     #  TODO: make this right for the case that we put causal_pos = 0
 
             seen_samples += num_samples
-            loss = outputs['loss'].sum() / num_samples
+            # This wouldn't lead to an accurate loss calculation, but it holds in expectation and is a good estimation
+            loss = outputs['loss'].sum() / (num_samples * acc_steps)
             loss.backward()
             substep += 1
             if substep % len(data["train"]) == 0:
@@ -130,6 +131,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         itr += 1
         # breakpoint()
         if itr % eval_freq == 0 or itr == iterations:  # from here it's only evaluation code, all the training is above
+
             if distributed_backend.is_master_process():
                 t1 = time.time()
                 dt = t1 - t0
