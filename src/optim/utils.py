@@ -64,20 +64,25 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
     loss_dict_val, acc_dict, perplexity_dict = {}, {}, {}
     loss_dict_val["all"] = []
     acc_dict["all"] = []
+
     sizes = [0 for _ in range(extra_args.max_context_ratio)]
 
     num_samples = 0
+    first_half_samples = 0
     mx_context = extra_args.max_context_ratio
     last_loss_token = extra_args.sequence_length
     original_seq_len = extra_args.sequence_length
 
     if extra_args.long_context:
-        last_loss_token *= mx_context
+        loss_dict_val["first_half"] = []
+        acc_dict["first_half"] = []
+
+        last_loss_token *= mx_context  # ???
         for i in range(mx_context):
             loss_dict_val[f"long_context_{i}"] = []
             acc_dict[f"long_context_{i}"] = []
 
-    for _ in range(max_num_batches):
+    for _ in range(max_num_batches*extra_args.max_context_ratio):
         causal_pos = 0
 
         if extra_args.dataset == 'cosmopedia':
@@ -120,6 +125,11 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
         # breakpoint()
         if extra_args.long_context:
             batch_size = x.shape[0]
+
+            loss_dict_val["first_half"].append(val_loss.view(batch_size, -1)[:, :int(original_seq_len/2)].sum())
+            acc_dict["first_half"].append(right_preds.view(batch_size, -1)[:, :int(original_seq_len/2)].sum())
+            first_half_samples += outputs['logit_mask'][:, :int(original_seq_len/2)].sum()
+
             for i in range(mx_context):
                 # breakpoint()
                 start = max(0, i*original_seq_len - causal_pos)
@@ -131,9 +141,13 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
 
     acc_dict["all"] = torch.stack(acc_dict["all"]).sum()/num_samples
     loss_dict_val["all"] = torch.stack(loss_dict_val["all"]).sum()/num_samples
-
     perplexity_dict["all"] = 2.71828 ** loss_dict_val["all"]
+
     if extra_args.long_context:
+        acc_dict["first_half"] = torch.stack(acc_dict["first_half"]).sum() / first_half_samples
+        loss_dict_val["first_half"] = torch.stack(loss_dict_val["first_half"]).sum() / first_half_samples
+        perplexity_dict["first_half"] = 2.71828 ** loss_dict_val["first_half"]
+        # TODO: make the "first half" part work with prefix as well.
         for i in range(mx_context):
             acc_dict[f"long_context_{i}"] = torch.stack(acc_dict[f"long_context_{i}"]).sum()/sizes[i]
             loss_dict_val[f"long_context_{i}"] = torch.stack(loss_dict_val[f"long_context_{i}"]).sum()/sizes[i]

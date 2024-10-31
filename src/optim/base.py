@@ -35,7 +35,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
     data["val"], val_sampler = get_dataloader(
         data["val"],
         sequence_length=sequence_length*extra_args.max_context_ratio if extra_args.long_context else sequence_length,
-        batch_size=batch_size,
+        batch_size=int(batch_size/extra_args.max_context_ratio),
         dataset=extra_args.dataset,
         seed=data_seed,
     )
@@ -175,9 +175,9 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
 
                     for key in val_loss:
                         if key != "all":
-                            logs[f"val/loss_{key}"] = val_loss[key].item()
-                            logs[f"val/perplexity_{key}"] = val_perplexity[key].item()
-                            logs[f"val/acc_{key}"] = val_acc[key].item()
+                            logs[f"val_loss/{key}"] = val_loss[key].item()
+                            logs[f"val_perplexity/{key}"] = val_perplexity[key].item()
+                            logs[f"val_acc/{key}"] = val_acc[key].item()
 
                     if itr == iterations:
                         logs["val/final-ppl"] = val_perplexity

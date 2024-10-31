@@ -234,7 +234,7 @@ class GPTBase(nn.Module):
         ))
 
         self.freqs_cis = None
-        if config.pe == 'rope':
+        if config.pe == 'rope' or config.pe == 'mixed':
             self.freqs_cis = precompute_freqs_cis(config.n_embd // config.n_head, effective_seq_len)
             # breakpoint()
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -303,7 +303,7 @@ class GPTBase(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
-        if pe == 'learnable':
+        if pe == 'learnable' or pe == 'mixed':
             abs_pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
             x = self.transformer.drop(tok_emb + abs_pos_emb)
         else:
@@ -312,7 +312,7 @@ class GPTBase(nn.Module):
         attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm, window, t/self.max_context_ratio)
 
         freqs_cis = None
-        if self.config.pe == 'rope':
+        if self.config.pe == 'rope' or self.config.pe == 'mixed':
             freqs_cis = self.freqs_cis.to(x.device)[pos[0]]
 
         # breakpoint()
