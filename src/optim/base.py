@@ -101,6 +101,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                                                                            gradient_accumulation_steps=acc_steps):
                     outputs = model(x,
                                     targets=y,
+                                    pe=extra_args.pe,
                                     prefixlm=extra_args.prefixlm_train,
                                     last_loss_token=last_loss_token,
                                     causal_pos=causal_pos)

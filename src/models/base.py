@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
+
 def get_logit_mask(b, t, causal_pos, last_loss_token, device):
     if type(causal_pos) == int:
         logit_mask = torch.zeros(b, t).bool()
@@ -65,6 +66,42 @@ def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False
     return final_mask.unsqueeze(1)
 
 
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    return torch.polar(torch.ones_like(freqs), freqs)  # complex64
+
+
+def _reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """
+    freqs_cis: complex - (seq_len, head_dim / 2)
+    x: complex - (bsz, seq_len, head_dim / 2)
+    """
+    ndim = x.ndim
+    assert 1 < ndim
+    assert freqs_cis.shape == (x.shape[-2], x.shape[-1]), (
+        freqs_cis.shape,
+        (x.shape[-2], x.shape[-1]),
+    )
+    shape = [d if i == 2 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+
+def apply_rotary_emb(q, k, freqs_cis):
+    # q, k: (B, nh, T, hs)
+    # freq_cis: (T, hs)
+    # return: (B, nh, T, hs), (B, nh, T, hs)
+
+    q_ = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
+    k_ = torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
+    freqs_cis = _reshape_for_broadcast(freqs_cis, q_)
+    xq_out = torch.view_as_real(q_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(k_ * freqs_cis).flatten(3)
+    # breakpoint()
+    return xq_out.type_as(q), xk_out.type_as(k)
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -75,36 +112,6 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-
-class RotaryEmbedding(nn.Module):
-
-    def __init__(self, dim, seq_len=2048, base=10000, device=None):
-        super().__init__()
-        self.base = base
-        self.device = device
-        self.dim = dim
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
-        self.register_buffer("inv_freq", self.inv_freq)
-
-        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-
-        freq = torch.einsum('i,j->ij', t, self.inv_freq)
-        emb = torch.cat((freq, freq), dim=-1)
-
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
-
-    @staticmethod
-    def rotate_half(x):
-        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-        return torch.cat((-x2, x1), dim=-1)
-
-    @staticmethod
-    def apply_rotary_pos_emb(q, k):
-        # q_emb = (q * cos_emb) + (RotaryEmbedding.rotate_half(q) * sin_emb)
-        # k_emb = (k * cos_emb) + (RotaryEmbedding.rotate_half(k) * sin_emb)
-
-        return q, k
 
 
 class CausalSelfAttention(nn.Module):
@@ -140,7 +147,7 @@ class CausalSelfAttention(nn.Module):
                                  .view(1, 1, config.sequence_length, config.sequence_length))
 
 
-    def forward(self, x, attn_mask):
+    def forward(self, x, attn_mask, freqs_cis=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -149,6 +156,8 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        if freqs_cis is not None:
+            q, k = apply_rotary_emb(q, k, freqs_cis)
         # if pe == 'rope':
         #     q, k = RotaryEmbedding.apply_rotary_pos_emb(q, k)
 
@@ -199,8 +208,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, attn_mask):
-        x = x + self.attn(self.ln_1(x), attn_mask)
+    def forward(self, x, attn_mask, freqs_cis=None):
+        x = x + self.attn(self.ln_1(x), attn_mask, freqs_cis=freqs_cis)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -224,9 +233,10 @@ class GPTBase(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
+        self.freqs_cis = None
         if config.pe == 'rope':
-            self.transformer.wpe = RotaryEmbedding(config.n_embd, effective_seq_len, device=config.device)
-
+            self.freqs_cis = precompute_freqs_cis(config.n_embd // config.n_head, effective_seq_len)
+            # breakpoint()
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -280,7 +290,7 @@ class GPTBase(nn.Module):
         b, t = idx.size()
         # assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
 
-        if self.config.random_pe:
+        if pe == 'random':
             # generating a sorted tensor with non-repeating integers between 0 and
             # self.config.max_context_ratio*self.config.sequence_length, with size (1, t)
             max_len = self.config.max_context_ratio*self.config.sequence_length
@@ -301,8 +311,13 @@ class GPTBase(nn.Module):
 
         attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm, window, t/self.max_context_ratio)
 
+        freqs_cis = None
+        if self.config.pe == 'rope':
+            freqs_cis = self.freqs_cis.to(x.device)[pos[0]]
+
+        # breakpoint()
         for block in self.transformer.h:
-            x = block(x, attn_mask)
+            x = block(x, attn_mask, freqs_cis=freqs_cis)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
