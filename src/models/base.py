@@ -78,24 +78,32 @@ def _reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Te
     freqs_cis: complex - (seq_len, head_dim / 2)
     x: complex - (bsz, seq_len, head_dim / 2)
     """
+    # breakpoint()
     ndim = x.ndim
     assert 1 < ndim
-    assert freqs_cis.shape == (x.shape[-2], x.shape[-1]), (
+    assert freqs_cis.shape[-2:] == (x.shape[-2], x.shape[-1]), (
         freqs_cis.shape,
         (x.shape[-2], x.shape[-1]),
     )
-    shape = [d if i == 2 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+
+    if freqs_cis.ndim == 3:
+        shape = [1 if i == 1 else d for i, d in enumerate(x.shape)]
+    else:  # TODO: find a more elegant solution :))
+        shape = [d if i == 2 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    # breakpoint()
+
     return freqs_cis.view(*shape)
 
 
 def apply_rotary_emb(q, k, freqs_cis):
     # q, k: (B, nh, T, hs)
-    # freq_cis: (T, hs)
+    # freq_cis: (B, T, hs) for random and (T, hs) for other
     # return: (B, nh, T, hs), (B, nh, T, hs)
 
-    q_ = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
+    q_ = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))  # (B, nh, T, hs//2, 2)
     k_ = torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
     freqs_cis = _reshape_for_broadcast(freqs_cis, q_)
+    # breakpoint()
     xq_out = torch.view_as_real(q_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(k_ * freqs_cis).flatten(3)
     # breakpoint()
@@ -290,13 +298,14 @@ class GPTBase(nn.Module):
         b, t = idx.size()
         # assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
 
-        if pe == 'random':
+        if self.config.random_pe:
             # generating a sorted tensor with non-repeating integers between 0 and
             # self.config.max_context_ratio*self.config.sequence_length, with size (1, t)
             max_len = self.config.max_context_ratio*self.config.sequence_length
-            rand_perm = torch.randperm(max_len, device=device, dtype=torch.long)[:t]
-            sorted_pos = rand_perm.sort()[0]
-            pos = sorted_pos.view(1, t)  # shape (1, t)
+
+            rand_perm = torch.argsort(torch.rand(b, max_len, device=device), dim=1)[:,:t]
+            pos = rand_perm.sort()[0]
+            # pos = sorted_pos.view(1, t)  # shape (1, t)
         else:
             pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, t)
 
@@ -304,8 +313,9 @@ class GPTBase(nn.Module):
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
         if pe == 'learnable' or pe == 'mixed':
-            abs_pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
-            x = self.transformer.drop(tok_emb + abs_pos_emb)
+            # breakpoint()
+            abs_pos_emb = self.transformer.wpe(pos.view(-1))  # position embeddings of shape (1, t, n_embd)
+            x = self.transformer.drop(tok_emb + abs_pos_emb.reshape(-1, t, self.config.n_embd))
         else:
             x = tok_emb
 
@@ -313,8 +323,14 @@ class GPTBase(nn.Module):
 
         freqs_cis = None
         if self.config.pe == 'rope' or self.config.pe == 'mixed':
-            freqs_cis = self.freqs_cis.to(x.device)[pos[0]]
+            if self.config.random_pe:
+                pos_reshaped = pos.reshape(-1)
+                pos_expanded = pos_reshaped.unsqueeze(-1).expand(pos_reshaped.shape[0], self.freqs_cis.size(1))
+                freqs_cis = torch.gather(self.freqs_cis.to(x.device), 0, pos_expanded).reshape(*pos.shape, -1)
+            else:
+                freqs_cis = self.freqs_cis.to(x.device)[pos[0]]
 
+        # breakpoint()
         # breakpoint()
         for block in self.transformer.h:
             x = block(x, attn_mask, freqs_cis=freqs_cis)
