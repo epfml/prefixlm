@@ -30,15 +30,14 @@ def get_logit_mask(b, t, causal_pos, last_loss_token, device):
     return logit_mask
 
 
-def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False, window=False, max_context_ratio=1):
+def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False, window=False, window_size=512):
     mask = torch.tril(torch.ones(sz, sz, device=dev))
 
     if type(prefix_ind) == int:
         #  TODO: fix the return mask here for the case that prefixlm=False
         mask[:prefix_ind, :prefix_ind] = 1
         if window:
-            breakpoint()
-            mask *= torch.triu(torch.ones((sz, sz), device=dev), diagonal=-int(sz/max_context_ratio))
+            mask *= torch.triu(torch.ones((sz, sz), device=dev), diagonal=-window_size)
         return mask.bool()
 
     #  constructing non-causal attention mask
@@ -58,7 +57,7 @@ def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False
         final_mask = (non_causal | causal).to(torch.float32)
 
     if window:
-        final_mask *= torch.triu(torch.ones((sz, sz), device=dev), diagonal=-int(sz/max_context_ratio)).unsqueeze(0)
+        final_mask *= torch.triu(torch.ones((sz, sz), device=dev), diagonal=-window_size).unsqueeze(0)
 
     final_mask[final_mask == 0] = -1e9
     final_mask[final_mask == 1] = 0
@@ -90,7 +89,6 @@ def _reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Te
         shape = [1 if i == 1 else d for i, d in enumerate(x.shape)]
     else:  # TODO: find a more elegant solution :))
         shape = [d if i == 2 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    # breakpoint()
 
     return freqs_cis.view(*shape)
 
@@ -242,7 +240,7 @@ class GPTBase(nn.Module):
         ))
 
         self.freqs_cis = None
-        if config.pe == 'rope' or config.pe == 'mixed':
+        if config.pe == 'rope' or config.pe == 'mixed' or config.pe == 'pose':
             self.freqs_cis = precompute_freqs_cis(config.n_embd // config.n_head, effective_seq_len)
             # breakpoint()
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -298,14 +296,22 @@ class GPTBase(nn.Module):
         b, t = idx.size()
         # assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
 
+        max_len = self.config.max_context_ratio * self.config.sequence_length
+
         if self.config.random_pe:
             # generating a sorted tensor with non-repeating integers between 0 and
             # self.config.max_context_ratio*self.config.sequence_length, with size (1, t)
-            max_len = self.config.max_context_ratio*self.config.sequence_length
-
+            # if torch.rand(1).item() < 0.9:  # Just to see if it helps if model sees sequential data from time to time
             rand_perm = torch.argsort(torch.rand(b, max_len, device=device), dim=1)[:,:t]
             pos = rand_perm.sort()[0]
+            # else:
+            #     pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
             # pos = sorted_pos.view(1, t)  # shape (1, t)
+        elif self.config.pe == 'pose':
+            chunks = torch.randint(1, t-1, (b, ), dtype=torch.long, device=device)   # For now, we assume there are only 2 chunks as paper suggests
+            biases = torch.randint(0, max_len - t + 1, (b, ), dtype=torch.long, device=device)    # It seems that they don't use biases for the first chunk!
+            pos = torch.arange(0, t, dtype=torch.long, device=device).repeat(b, 1)
+            pos += (pos >= chunks.unsqueeze(1)) * biases.unsqueeze(1)
         else:
             pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, t)
 
@@ -319,11 +325,12 @@ class GPTBase(nn.Module):
         else:
             x = tok_emb
 
-        attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm, window, t/self.max_context_ratio)
+        attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm, window, self.config.sequence_length)
 
         freqs_cis = None
-        if self.config.pe == 'rope' or self.config.pe == 'mixed':
-            if self.config.random_pe:
+        if self.config.pe == 'rope' or self.config.pe == 'mixed' or self.config.pe == 'pose':
+            # breakpoint()
+            if pos.shape[0] > 1: # if we have different positions for each sample in the batch
                 pos_reshaped = pos.reshape(-1)
                 pos_expanded = pos_reshaped.unsqueeze(-1).expand(pos_reshaped.shape[0], self.freqs_cis.size(1))
                 freqs_cis = torch.gather(self.freqs_cis.to(x.device), 0, pos_expanded).reshape(*pos.shape, -1)
