@@ -58,7 +58,7 @@ def add_special_token(x, y, causal_pos):
 
 
 @torch.no_grad()
-def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx=nullcontext()):
+def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx=nullcontext(), itr=0):
     assert model.training == False
 
     loss_dict_val, acc_dict, perplexity_dict = {}, {}, {}
@@ -82,7 +82,7 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
             loss_dict_val[f"long_context_{i}"] = []
             acc_dict[f"long_context_{i}"] = []
 
-    for _ in range(max_num_batches*extra_args.max_context_ratio):
+    for _ in range(max_num_batches):
         causal_pos = 0
 
         if extra_args.dataset == 'cosmopedia':
@@ -100,16 +100,20 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
         if extra_args.eval_normalizer:
             eval_normalizer = uniform_step(100, 0.9, original_seq_len)
 
+        # breakpoint()
         with ctx:
             outputs = model(x,
                             targets=y,
+                            pe=extra_args.pe,
                             prefixlm=extra_args.prefixlm_eval,
                             last_loss_token=last_loss_token,
                             get_logits=True,
                             causal_pos=causal_pos,
                             eval_normalizer=eval_normalizer,
-                            window=extra_args.window)
-
+                            window=extra_args.window,
+                            itr=itr,
+                            evaluation=True
+                            )   # We don't give itr because we need it only for fine-tuning for now
         logit_mask = outputs['logit_mask']
         num_samples += outputs['num_samples']
         # if outputs['num_samples'] != 65536:

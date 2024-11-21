@@ -134,7 +134,8 @@ def get_dataloader(data, sequence_length, batch_size, dataset='slimpajama', seed
         dataset,
         sampler=sampler,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=8,
+        pin_memory=True
     )
 
     # breakpoint()

@@ -30,7 +30,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         seed=data_seed,
         distributed_backend=distributed_backend,
     )
-
+    sampler_state_before_iter = None
 
     data["val"], val_sampler = get_dataloader(
         data["val"],
@@ -71,12 +71,13 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
         np.random.set_state(rng_state_dict["numpy_rng_state"])
         random.setstate(rng_state_dict["py_rng_state"])
     for _ in range(substep % num_substeps_per_epoch):
-        get_batch(data_train_iter, device=extra_args.device)
+        get_batch(data_train_iter, extra_args.dataset, device=extra_args.device)
 
     seen_samples = 0
     generation_string = extra_args.eval_seq_prefix
 
     while itr < iterations:
+        # print('iter:', itr)
         for microstep_idx in range(acc_steps):  # gradient accumulation
             causal_pos = 0
             num_samples = 0
@@ -104,8 +105,10 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                                     pe=extra_args.pe,
                                     prefixlm=extra_args.prefixlm_train,
                                     last_loss_token=last_loss_token,
-                                    causal_pos=causal_pos)
+                                    causal_pos=causal_pos,
+                                    itr=itr)
                     num_samples += outputs['num_samples']
+
                     #  TODO: make this right for the case that we put causal_pos = 0
 
             seen_samples += num_samples
@@ -126,6 +129,15 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
 
         if extra_args.grad_clip != 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), extra_args.grad_clip)
+
+        # Move optimizer state to the correct device
+        # for param_group in opt.param_groups:
+        #     for p in param_group['params']:
+        #         p.data = p.data.to(torch.device(f'cuda:{torch.distributed.get_rank()}'))
+        #         if p.grad is not None:
+        #             print('there is grad that is not None')
+        #             p.grad.data = p.grad.data.to(torch.device(f'cuda:{torch.distributed.get_rank()}'))
+
         opt.step()
         scheduler.step()
         opt.zero_grad(set_to_none=True)
@@ -143,7 +155,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                 current_lr = scheduler.get_last_lr()[0] if scheduler is not None else extra_args.lr
 
                 eval_steps = (
-                    24 if itr < iterations else len(data["val"])
+                    24*extra_args.max_context_ratio if itr < iterations else len(data["val"])
                 )
                 val_acc, val_loss, val_perplexity = eval(
                     model,
@@ -152,6 +164,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                     device=extra_args.device,
                     max_num_batches=eval_steps,
                     ctx=type_ctx,
+                    itr=itr
                 )
 
                 print_string = (f"{epoch}/{itr} [train] loss={train_loss:.3f} [val] loss={val_loss['all'].item():.3f},"
@@ -186,16 +199,16 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
 
                     wandb.log(logs)
 
-                    if extra_args.eval_seq_prefix != 'none' and (itr % (eval_freq * 5) == 0 or itr == iterations):
-                        if text_table is None:
-                            text_table = wandb.Table(columns=["itr", "val-pp", "text"])
+                    # if extra_args.eval_seq_prefix != 'none' and (itr % (eval_freq * 5) == 0 or itr == iterations):
+                    #     if text_table is None:
+                    #         text_table = wandb.Table(columns=["itr", "val-pp", "text"])
 
-                        out_str = distributed_backend.get_raw_model(model).generate_from_string(
-                            generation_string, max_new_tokens=100, temperature=0.9, top_k=None)
-                        print('out_str is: ', out_str)
-                        text_table.add_data(itr, val_perplexity, out_str)
-                        # why a copy? see github.com/wandb/wandb/issues/2981
-                        wandb.log({f"generated-text-{wandb.run.name}": copy.copy(text_table)})
+                        # out_str = distributed_backend.get_raw_model(model).generate_from_string(
+                        #     generation_string, max_new_tokens=100, temperature=0.9, top_k=None)
+                        # print('out_str is: ', out_str)
+                        # text_table.add_data(itr, val_perplexity, out_str)
+                        # # why a copy? see github.com/wandb/wandb/issues/2981
+                        # wandb.log({f"generated-text-{wandb.run.name}": copy.copy(text_table)})
 
                 model.train()
                 t0 = time.time()
@@ -211,7 +224,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                                 gpu_rng_state=torch.cuda.get_rng_state(),
                                 numpy_rng_state=np.random.get_state(),
                                 py_rng_state=random.getstate(),
-                                train_sampler_state=sampler_state_before_iter,
+                                train_sampler_state=sampler_state_before_iter,  # I initialized it with None, does this work?
                                 ckpt_path=os.path.join(os.path.dirname(ckpt_path), f"ckpt_{itr}.pt"))
 
     if distributed_backend.is_master_process():

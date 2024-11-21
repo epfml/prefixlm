@@ -8,7 +8,7 @@ import copy
 import argparse
 import random
 import wandb
-
+import re
 import config
 from models.utils import get_model
 from data.utils import get_dataset
@@ -90,14 +90,14 @@ def main(args):
     if distributed_backend.is_master_process() and args.wandb:
         params_copy = copy.deepcopy(vars(args))
         del params_copy['device']
-        print('it gets here')
         wandb.init(project=args.wandb_project, name=exp_name, config=params_copy)
         print('it doesnt get here?')
-    
+    print('it gets here')
+
     ckpt_path = os.path.join(args.results_base_folder, args.dataset, args.model, exp_name)
     if not os.path.exists(ckpt_path):
         if distributed_backend.is_master_process():
-            os.makedirs(ckpt_path)
+            os.makedirs(os.path.abspath(ckpt_path))
         distributed_backend.sync()
     elif os.path.isfile(os.path.join(ckpt_path, "summary.json")): # the experiment was already completed
         print(f"Already found experiment '{ckpt_path}'.\nSkipping.")
@@ -108,18 +108,23 @@ def main(args):
     if args.use_pretrained == "auto":
         checkpoints = [file for file in os.listdir(ckpt_path) if 'ckpt_' in file]
         if checkpoints:
-            args.use_pretrained = sorted(checkpoints)[-1]
+            def extract_number(filename):
+                match = re.search(r'\d+', filename)  # Find the first number in the filename
+                return int(match.group()) if match else -1  # Return -1 if no number is found
+
+            args.use_pretrained = sorted(checkpoints, key=extract_number)[-1]
         else:
             args.use_pretrained = None
     
     if args.use_pretrained is not None:
         last_ckpt_path = args.use_pretrained
         print(f"Resuming from {last_ckpt_path}")
-        checkpoint = torch.load(os.path.join(ckpt_path, last_ckpt_path))
+        checkpoint = torch.load(os.path.join(ckpt_path, last_ckpt_path), map_location="cpu")
+
         model_state_dict = {distributed_backend.translate_model_parameter_name_for_node(k.replace("_orig_mod.", ""))[0]:v for k,v in checkpoint['model'].items()}
         # FIXME checkpoints from compiled model have _orig_mod keyword
-
         optimizer_state_dict = checkpoint['optimizer']
+
         rng_state_dict = {
             module: checkpoint[module] for module in [
                 "cpu_rng_state", 
@@ -130,8 +135,10 @@ def main(args):
             ]
         }
 
-        model.load_state_dict(model_state_dict) 
+        model.load_state_dict(model_state_dict)
+        model.to(torch.device(f'cuda:{torch.distributed.get_rank()}'))
         opt.load_state_dict(optimizer_state_dict)
+
         itr = checkpoint['itr']
         if scheduler is not None:
             scheduler_state_dict = checkpoint['scheduler']
@@ -141,6 +148,15 @@ def main(args):
         train = train_base
     else:
         raise NotImplementedError(f"No training method implemented for model type '{args.model}'.")
+
+    for state in opt.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(torch.device(f'cuda:{torch.distributed.get_rank()}'))
+
+    torch.distributed.barrier()
+    del checkpoint
+    torch.cuda.empty_cache()
 
     print(f"\nTraining model={args.model} \n{vars(args)}\n")
 

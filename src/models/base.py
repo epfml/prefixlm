@@ -64,10 +64,23 @@ def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False
     # print('last tokens are:', last_loss_token)
     return final_mask.unsqueeze(1)
 
+def get_log_mask(dev, sz):
+    mask = torch.arange(sz, device=dev).unsqueeze(1) - torch.arange(sz, device=dev).unsqueeze(0)
+    logarithms = 2 ** torch.arange(int(np.log2(sz))+1, device=dev)
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    mask[torch.isin(mask, logarithms)] = 0
+    mask[mask != 0] = 1
+    mask = 1 - mask
+
+    return mask.bool()
+
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, pos_int: bool = False, mx_context: int = 1) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
+    if pos_int:
+        t = torch.arange(end, device=freqs.device).float() / mx_context
+    else:
+        t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
     return torch.polar(torch.ones_like(freqs), freqs)  # complex64
 
@@ -229,20 +242,23 @@ class GPTBase(nn.Module):
         self.tokenizer = tiktoken.get_encoding("gpt2")
         self.max_context_ratio = config.max_context_ratio
 
-        effective_seq_len = config.sequence_length*config.max_context_ratio if config.long_context else config.sequence_length
+        self.effective_seq_len = config.sequence_length*config.max_context_ratio
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             # Here I assume we generalize until max_context_ratio! TBD later...
-            wpe = nn.Embedding(effective_seq_len, config.n_embd),
+            wpe = nn.Embedding(self.effective_seq_len, config.n_embd) if config.pe == 'learnable' or config.pe == 'mixed' else nn.Identity(),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
         self.freqs_cis = None
-        if config.pe == 'rope' or config.pe == 'mixed' or config.pe == 'pose':
-            self.freqs_cis = precompute_freqs_cis(config.n_embd // config.n_head, effective_seq_len)
+        if config.pe == 'rope' or config.pe == 'mixed' or config.pe == 'pose' or config.pe == 'pose-ft':
+            print('freqs are initialized')
+            self.freqs_cis = precompute_freqs_cis(config.n_embd // config.n_head, self.effective_seq_len)
             # breakpoint()
+        self.log_mask = None
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -268,8 +284,6 @@ class GPTBase(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -290,13 +304,21 @@ class GPTBase(nn.Module):
                 get_logits=False,
                 causal_pos=0,
                 eval_normalizer=None,
-                window=False):
+                window=False,
+                itr=0,
+                evaluation=False):
 
         device = idx.device
         b, t = idx.size()
         # assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
 
         max_len = self.config.max_context_ratio * self.config.sequence_length
+        # breakpoint()
+
+        if self.config.interpolation and itr >= self.config.ft_itr:
+            self.freqs_cis = precompute_freqs_cis(self.config.n_embd // self.config.n_head, self.effective_seq_len,
+                                                  pos_int=True, mx_context=self.config.max_context_ratio)
+
 
         if self.config.random_pe:
             # generating a sorted tensor with non-repeating integers between 0 and
@@ -307,9 +329,12 @@ class GPTBase(nn.Module):
             # else:
             #     pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
             # pos = sorted_pos.view(1, t)  # shape (1, t)
-        elif self.config.pe == 'pose':
-            chunks = torch.randint(1, t-1, (b, ), dtype=torch.long, device=device)   # For now, we assume there are only 2 chunks as paper suggests
-            biases = torch.randint(0, max_len - t + 1, (b, ), dtype=torch.long, device=device)    # It seems that they don't use biases for the first chunk!
+        elif self.config.pe == 'pose' or (self.config.pe == 'pose-ft' and itr >= self.config.ft_itr and evaluation is False):
+            # the threshold for fine-tuning should be changeable
+            chunks = torch.randint(1, t-1, (b, ), dtype=torch.long, device=device)
+            # For now, we assume there are only 2 chunks as paper suggests
+            biases = torch.randint(0, max_len - t + 1, (b, ), dtype=torch.long, device=device)
+            # It seems that they don't use biases for the first chunk!
             pos = torch.arange(0, t, dtype=torch.long, device=device).repeat(b, 1)
             pos += (pos >= chunks.unsqueeze(1)) * biases.unsqueeze(1)
         else:
@@ -319,16 +344,20 @@ class GPTBase(nn.Module):
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
         if pe == 'learnable' or pe == 'mixed':
-            # breakpoint()
             abs_pos_emb = self.transformer.wpe(pos.view(-1))  # position embeddings of shape (1, t, n_embd)
             x = self.transformer.drop(tok_emb + abs_pos_emb.reshape(-1, t, self.config.n_embd))
         else:
             x = tok_emb
 
-        attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm, window, self.config.sequence_length)
+        if self.config.log_mask:
+            if self.log_mask is None:
+                self.log_mask = get_log_mask(device, t)
+            attn_mask = self.log_mask
+        else:
+            attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm, window, self.config.sequence_length)
 
         freqs_cis = None
-        if self.config.pe == 'rope' or self.config.pe == 'mixed' or self.config.pe == 'pose':
+        if self.config.pe == 'rope' or self.config.pe == 'mixed' or self.config.pe == 'pose' or self.config.pe == 'pose-ft':
             # breakpoint()
             if pos.shape[0] > 1: # if we have different positions for each sample in the batch
                 pos_reshaped = pos.reshape(-1)
@@ -357,7 +386,7 @@ class GPTBase(nn.Module):
             loss = F.cross_entropy((logits[logit_mask, :]).reshape(-1, logits.size(-1)),
                                    (targets[logit_mask]).reshape(-1),
                                    ignore_index=-1,
-                                   reduction='none') #TODO: take care of it for standard context setups
+                                   reduction='none')  # TODO: take care of it for standard context setups
 
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position

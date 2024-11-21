@@ -36,7 +36,7 @@ class DataParallelDistributedBackend(DistributedBackend):
         return args
 
     def transform_model(self, model):
-        return DDP(model, device_ids=[self.local_rank], find_unused_parameters=True)
+        return DDP(model, device_ids=[self.local_rank])
 
     @contextmanager
     def get_context_for_microstep_forward(self, model, microstep_idx, gradient_accumulation_steps):
