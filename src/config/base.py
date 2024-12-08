@@ -35,8 +35,11 @@ def parse_args(base_parser, args, namespace):
     # to make evaluation comparable with prefixlm_eval
     # it chooses a prefix and avoid calculating loss for it
     parser.add_argument('--eval_normalizer', action='store_true')
-    parser.add_argument('--window', action='store_true')
+    parser.add_argument('--train_window', action='store_true')
+    parser.add_argument('--eval_window', action='store_true')
+    parser.add_argument('--window_size', default=512, type=int)
     parser.add_argument('--log_mask', action='store_true')
+    parser.add_argument('--c_log_mask', default=1, type=int)
     # Dataset params
     parser.add_argument('--dataset', default='slimpajama', choices=['slimpajama', 'wikitext', "shakespeare-char", 'arxiv', "arxiv2000", "arxiv+wiki", 'openwebtext2', 'cosmopedia'])
     parser.add_argument('--vocab_size', default=50304, type=int)

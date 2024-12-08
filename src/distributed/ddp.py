@@ -36,6 +36,7 @@ class DataParallelDistributedBackend(DistributedBackend):
         return args
 
     def transform_model(self, model):
+
         return DDP(model, device_ids=[self.local_rank])
 
     @contextmanager

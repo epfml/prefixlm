@@ -62,13 +62,14 @@ def main(args):
     distributed_backend = distributed.make_backend_from_args(args)
     args = distributed_backend.get_adjusted_args_for_process(args)
 
-    args.window = True
+    # args.window = True
+    args.use_pretrained = 'ckpt.pt'
     # args.max_context_ratio = 2
     # args.sequence_length = 2048
     # args.long_context = False
-    # args.window = False
-    # args.batch_size = 32
-    # args.acc_steps = 4
+
+    args.batch_size = 64
+    args.acc_steps = 2
     args.device = torch.device(args.device)
     torch.cuda.set_device(args.device)
     device_type = 'cuda' if 'cuda' in str(args.device) else 'cpu'
@@ -84,8 +85,6 @@ def main(args):
     distributed_backend.sync()
 
     data = get_dataset(args)  # data is a dict: {'train': train_tokenized, 'val': eval_tokenized}
-
-
 
 
     print(f"Num training tokens: {len(data['train'])}")
@@ -106,11 +105,17 @@ def main(args):
     model = models_utils.get_model(args).to(args.device)
 
     if args.checkpoint is not None:
-        checkpoint = torch.load(os.path.join(args.checkpoint, args.checkpoint_filename))
+        print(args.checkpoint)
+        print(args.checkpoint_filename)
+        checkpoint = torch.load(os.path.join(args.checkpoint, args.checkpoint_filename), map_location="cpu")
         model.load_state_dict({x: y for x, y in checkpoint['model'].items() if "attn.bias" not in x and "wpe" not in x},
                               strict=False)
+        model.to(torch.device(f'cuda:0'))
+
 
     model = distributed_backend.transform_model(model)
+
+    # breakpoint()
 
     print(f"\Evaluating model={args.model} \n{vars(args)}\n")
 
@@ -122,11 +127,13 @@ def main(args):
     type_ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(
         device_type=device_type, dtype=torch.bfloat16)  # extra_args.dtype)
 
+
     model.eval()
     # breakpoint()
-    stats = eval(model, data_iter, args, device=args.device, max_num_batches=len(data), ctx=type_ctx)
+    stats = eval(model, data_iter, args, device=args.device, max_num_batches=len(data), ctx=type_ctx, itr=25000)
 
     distributed_backend.finalize()
+    # print(stats)
 
     first_half = stats[2]['first_half']
     long_context_0 = stats[2]['long_context_0']
@@ -137,10 +144,37 @@ def main(args):
                                     stats[2]['long_context_4'].item() + stats[2]['long_context_5'].item() +
                                     stats[2]['long_context_6'].item() + stats[2]['long_context_7'].item())/8
 
+    # mean_long_context_0_16 = (stats[2]['long_context_0'].item() + stats[2]['long_context_1'].item() +
+    #                          stats[2]['long_context_2'].item() + stats[2]['long_context_3'].item() +
+    #                          stats[2]['long_context_4'].item() + stats[2]['long_context_5'].item() +
+    #                          stats[2]['long_context_6'].item() + stats[2]['long_context_7'].item() +
+    #                          stats[2]['long_context_8'].item() + stats[2]['long_context_9'].item() +
+    #                          stats[2]['long_context_10'].item() + stats[2]['long_context_11'].item() +
+    #                          stats[2]['long_context_12'].item() + stats[2]['long_context_13'].item() +
+    #                          stats[2]['long_context_14'].item() + stats[2]['long_context_15'].item()) / 16
+
+    # mean_long_context_0_32 = (stats[2]['long_context_0'].item() + stats[2]['long_context_1'].item() +
+    #                           stats[2]['long_context_2'].item() + stats[2]['long_context_3'].item() +
+    #                           stats[2]['long_context_4'].item() + stats[2]['long_context_5'].item() +
+    #                           stats[2]['long_context_6'].item() + stats[2]['long_context_7'].item() +
+    #                           stats[2]['long_context_8'].item() + stats[2]['long_context_9'].item() +
+    #                           stats[2]['long_context_10'].item() + stats[2]['long_context_11'].item() +
+    #                           stats[2]['long_context_12'].item() + stats[2]['long_context_13'].item() +
+    #                           stats[2]['long_context_14'].item() + stats[2]['long_context_15'].item() +
+    #                           stats[2]['long_context_16'].item() + stats[2]['long_context_17'].item() +
+    #                           stats[2]['long_context_18'].item() + stats[2]['long_context_19'].item() +
+    #                           stats[2]['long_context_20'].item() + stats[2]['long_context_21'].item() +
+    #                           stats[2]['long_context_22'].item() + stats[2]['long_context_23'].item() +
+    #                           stats[2]['long_context_24'].item() + stats[2]['long_context_25'].item() +
+    #                           stats[2]['long_context_26'].item() + stats[2]['long_context_27'].item() +
+    #                           stats[2]['long_context_28'].item() + stats[2]['long_context_29'].item() +
+    #                           stats[2]['long_context_30'].item() + stats[2]['long_context_31'].item()) / 32
     print('first half', first_half, '\nlong context0', long_context_0, '\nlong context0-4', mean_long_context_0_4,
           '\nlong context0-8', mean_long_context_0_8)
+    # , '\nlong context0-16', mean_long_context_0_16)
+    # , '\nlong context0-32', mean_long_context_0_32)
 
-    print(stats)
+    # print(stats)
 
     return stats
 

@@ -64,13 +64,25 @@ def get_mask_for_batch(dev, sz, prefix_ind, last_loss_token=None, prefixlm=False
     # print('last tokens are:', last_loss_token)
     return final_mask.unsqueeze(1)
 
-def get_log_mask(dev, sz):
+
+def get_log_mask(dev, sz, c=1, window=False, window_size=1):
     mask = torch.arange(sz, device=dev).unsqueeze(1) - torch.arange(sz, device=dev).unsqueeze(0)
-    logarithms = 2 ** torch.arange(int(np.log2(sz))+1, device=dev)
+
+    logarithms = []
+    for i in range(sz):  # finding the numbers with at most c 1s in their binary representation
+        if str(bin(i)).count('1') <= c:
+            logarithms.append(i)
+
+    logarithms = torch.tensor(logarithms, device=dev)
 
     mask[torch.isin(mask, logarithms)] = 0
     mask[mask != 0] = 1
-    mask = 1 - mask
+    mask = (1 - mask)
+
+    if window:
+        print(type(mask), dev)
+        mask |= (torch.triu(torch.ones((sz, sz), device=dev), diagonal=-window_size).bool() * torch.tril(torch.ones((sz, sz), device=dev).float()).bool())
+
 
     return mask.bool()
 
@@ -319,6 +331,7 @@ class GPTBase(nn.Module):
             self.freqs_cis = precompute_freqs_cis(self.config.n_embd // self.config.n_head, self.effective_seq_len,
                                                   pos_int=True, mx_context=self.config.max_context_ratio)
 
+        # breakpoint()
 
         if self.config.random_pe:
             # generating a sorted tensor with non-repeating integers between 0 and
@@ -351,10 +364,10 @@ class GPTBase(nn.Module):
 
         if self.config.log_mask:
             if self.log_mask is None:
-                self.log_mask = get_log_mask(device, t)
+                self.log_mask = get_log_mask(device, t, c=self.config.c_log_mask, window=window, window_size=self.config.window_size)
             attn_mask = self.log_mask
         else:
-            attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm, window, self.config.sequence_length)
+            attn_mask = get_mask_for_batch(device, t, causal_pos, last_loss_token, prefixlm, window, window_size=self.config.window_size)
 
         freqs_cis = None
         if self.config.pe == 'rope' or self.config.pe == 'mixed' or self.config.pe == 'pose' or self.config.pe == 'pose-ft':

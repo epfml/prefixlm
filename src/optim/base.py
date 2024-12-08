@@ -106,6 +106,7 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                                     prefixlm=extra_args.prefixlm_train,
                                     last_loss_token=last_loss_token,
                                     causal_pos=causal_pos,
+                                    window=extra_args.train_window,
                                     itr=itr)
                     num_samples += outputs['num_samples']
 

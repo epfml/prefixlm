@@ -110,13 +110,13 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
                             get_logits=True,
                             causal_pos=causal_pos,
                             eval_normalizer=eval_normalizer,
-                            window=extra_args.window,
+                            window=extra_args.eval_window,
                             itr=itr,
                             evaluation=True
                             )   # We don't give itr because we need it only for fine-tuning for now
         logit_mask = outputs['logit_mask']
         num_samples += outputs['num_samples']
-        # if outputs['num_samples'] != 65536:
+        # if outputs['num_samples'] != 65536:رشم
         #     print('num_samples is not 65536')
         #     breakpoint()
         # breakpoint()
@@ -143,6 +143,7 @@ def eval(model, data_val_iter, extra_args, device='cpu', max_num_batches=24, ctx
                 acc_dict[f"long_context_{i}"].append(right_preds.view(batch_size, -1)[:, start:end].sum())
                 sizes[i] += outputs['logit_mask'][:,start:end].sum()
 
+            # breakpoint()
     acc_dict["all"] = torch.stack(acc_dict["all"]).sum()/num_samples
     loss_dict_val["all"] = torch.stack(loss_dict_val["all"]).sum()/num_samples
     perplexity_dict["all"] = 2.71828 ** loss_dict_val["all"]

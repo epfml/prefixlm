@@ -106,7 +106,9 @@ def main(args):
     itr = 0
     rng_state_dict = None
     if args.use_pretrained == "auto":
+        print(ckpt_path)
         checkpoints = [file for file in os.listdir(ckpt_path) if 'ckpt_' in file]
+
         if checkpoints:
             def extract_number(filename):
                 match = re.search(r'\d+', filename)  # Find the first number in the filename
@@ -153,10 +155,6 @@ def main(args):
         for key, value in state.items():
             if isinstance(value, torch.Tensor):
                 state[key] = value.to(torch.device(f'cuda:{torch.distributed.get_rank()}'))
-
-    torch.distributed.barrier()
-    del checkpoint
-    torch.cuda.empty_cache()
 
     print(f"\nTraining model={args.model} \n{vars(args)}\n")
 
